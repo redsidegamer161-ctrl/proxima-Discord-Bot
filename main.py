@@ -3,20 +3,21 @@ from discord import app_commands
 import sqlite3
 import datetime
 import os
-import asyncio  # added for timeout handling
+import asyncio
+import time  # for retry backoff
 from keep_alive import keep_alive
 
 # --- IMPORTS FOR IMAGE GENERATION ---
 from PIL import Image, ImageDraw, ImageFont
 import io
 import aiohttp
-import urllib.request  # To download font automatically
+import urllib.request
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get('TOKEN')
 DEFAULT_BG_FILE = "proxima_default.jpg"
 
-# --- AUTO-DOWNLOAD FONT (No upload needed!) ---
+# --- AUTO-DOWNLOAD FONT ---
 def check_and_download_font():
     if not os.path.exists("font.ttf"):
         print("System: Font missing. Downloading Roboto-Bold...")
@@ -27,14 +28,12 @@ def check_and_download_font():
         except Exception as e:
             print(f"System: Could not download font. Text will be small. Error: {e}")
 
-# Call this immediately
 check_and_download_font()
 
 # --- DATABASE SETUP ---
 conn = sqlite3.connect('team_manager.db')
 c = conn.cursor()
 
-# 1. Global Settings
 c.execute("""CREATE TABLE IF NOT EXISTS global_config (
              guild_id INTEGER PRIMARY KEY,
              manager_role_id INTEGER,
@@ -45,7 +44,6 @@ c.execute("""CREATE TABLE IF NOT EXISTS global_config (
              demand_limit INTEGER DEFAULT 3
              )""")
 
-# 2. Teams Table
 c.execute("""CREATE TABLE IF NOT EXISTS teams (
              team_role_id INTEGER PRIMARY KEY,
              logo TEXT,
@@ -53,7 +51,6 @@ c.execute("""CREATE TABLE IF NOT EXISTS teams (
              transaction_image TEXT
              )""")
 
-# 3. Free Agents
 c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
              user_id INTEGER PRIMARY KEY,
              region TEXT,
@@ -62,34 +59,24 @@ c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
              timestamp TEXT
              )""")
 
-# 4. Player Stats
 c.execute("""CREATE TABLE IF NOT EXISTS player_stats (
              user_id INTEGER PRIMARY KEY,
              transfers INTEGER DEFAULT 0,
              demands INTEGER DEFAULT 0
              )""")
 
-# --- DATABASE MIGRATIONS ---
-try:
-    c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
-except sqlite3.OperationalError:
-    pass
-try:
-    c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
-except sqlite3.OperationalError:
-    pass
-try:
-    c.execute("ALTER TABLE teams ADD COLUMN transaction_image TEXT")
-except sqlite3.OperationalError:
-    pass
-try:
-    c.execute("ALTER TABLE global_config ADD COLUMN demand_limit INTEGER DEFAULT 3")
-except sqlite3.OperationalError:
-    pass
+# Migrations
+try: c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
+except: pass
+try: c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
+except: pass
+try: c.execute("ALTER TABLE teams ADD COLUMN transaction_image TEXT")
+except: pass
+try: c.execute("ALTER TABLE global_config ADD COLUMN demand_limit INTEGER DEFAULT 3")
+except: pass
 conn.commit()
 
 # --- HELPER FUNCTIONS ---
-
 def get_global_config(guild_id):
     c.execute("SELECT * FROM global_config WHERE guild_id = ?", (guild_id,))
     return c.fetchone()
@@ -112,7 +99,7 @@ def get_player_stats(user_id):
     return data
 
 def update_stat(user_id, stat_type, amount=1):
-    get_player_stats(user_id)  # Ensure exists
+    get_player_stats(user_id)
     if stat_type == "transfer":
         c.execute("UPDATE player_stats SET transfers = transfers + ? WHERE user_id = ?", (amount, user_id))
     elif stat_type == "demand":
@@ -127,30 +114,24 @@ def find_user_team(member):
             return (role, data[1], data[2], trans_img)
     return None
 
-def is_staff(interaction: discord.Interaction):
+def is_staff(interaction):
     return interaction.user.guild_permissions.administrator
 
 def is_window_open(guild_id):
     config = get_global_config(guild_id)
-    if not config:
-        return True
-    try:
-        return config[5] == 1
-    except IndexError:
-        return True
+    if not config: return True
+    try: return config[5] == 1
+    except IndexError: return True
 
 def get_managers_of_team(guild, team_role):
     config = get_global_config(guild.id)
-    if not config:
-        return ([], [])
+    if not config: return ([], [])
     mgr_id, asst_id = config[1], config[2]
     head_managers, assistants = [], []
     for member in team_role.members:
         r_ids = [r.id for r in member.roles]
-        if mgr_id in r_ids:
-            head_managers.append(member)
-        elif asst_id in r_ids:
-            assistants.append(member)
+        if mgr_id in r_ids: head_managers.append(member)
+        elif asst_id in r_ids: assistants.append(member)
     return (head_managers, assistants)
 
 async def cleanup_free_agent(guild, member):
@@ -160,65 +141,52 @@ async def cleanup_free_agent(guild, member):
     if config and config[4]:
         role = guild.get_role(config[4])
         if role and role in member.roles:
-            try:
-                await member.remove_roles(role)
-            except:
-                pass
+            try: await member.remove_roles(role)
+            except: pass
 
 def format_roster_list(members, mgr_id, asst_id):
-    formatted_list = []
+    formatted = []
     for m in members:
         r_ids = [r.id for r in m.roles]
         name = m.mention
-        if mgr_id in r_ids:
-            name += " **(TM)**"
-        elif asst_id in r_ids:
-            name += " **(AM)**"
-        formatted_list.append(name)
-    return formatted_list
+        if mgr_id in r_ids: name += " **(TM)**"
+        elif asst_id in r_ids: name += " **(AM)**"
+        formatted.append(name)
+    return formatted
 
-# --- MASTER CARD GENERATOR (with timeouts!) ---
+# --- CARD GENERATOR (with timeouts) ---
 async def generate_transaction_card(player, team_name, team_color, title_text="OFFICIAL SIGNING", custom_bg_url=None):
     W, H = 800, 400
     img = None
 
-    # 1. Try Custom URL (from /decorate_transactions)
     if custom_bg_url:
         try:
-            timeout = aiohttp.ClientTimeout(total=10)  # 10 second timeout
+            timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(custom_bg_url) as resp:
                     if resp.status == 200:
                         data = await resp.read()
                         bg_img = Image.open(io.BytesIO(data)).convert("RGB")
                         img = bg_img.resize((W, H))
-                        # Dark Overlay so text pops
-                        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                        overlay = Image.new("RGBA", (W, H), (0,0,0,0))
                         draw_overlay = ImageDraw.Draw(overlay)
-                        draw_overlay.rectangle([(0, 240), (W, H)], fill=(0, 0, 0, 160))
-                        img.paste(overlay, (0, 0), mask=overlay)
-        except (asyncio.TimeoutError, aiohttp.ClientError, Exception):
-            img = None  # fall through to next option
+                        draw_overlay.rectangle([(0, 240), (W, H)], fill=(0,0,0,160))
+                        img.paste(overlay, (0,0), mask=overlay)
+        except: img = None
 
-    # 2. Try Local File (If you ever upload one)
     if img is None and os.path.exists(DEFAULT_BG_FILE):
         try:
             bg_img = Image.open(DEFAULT_BG_FILE).convert("RGB")
             img = bg_img.resize((W, H))
-        except:
-            pass
+        except: pass
 
-    # 3. FALLBACK: Paint the background with the Team Color
     if img is None:
         bg_color = team_color.to_rgb()
-        # If color is default (black/transparent), make it Dark Grey
-        if bg_color == (0, 0, 0):
-            bg_color = (44, 47, 51)
+        if bg_color == (0,0,0): bg_color = (44,47,51)
         img = Image.new("RGB", (W, H), color=bg_color)
 
     draw = ImageDraw.Draw(img)
 
-    # 4. Avatar (with timeout)
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -226,31 +194,24 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
                 if resp.status == 200:
                     data = await resp.read()
                     avatar = Image.open(io.BytesIO(data)).convert("RGBA")
-                    avatar = avatar.resize((200, 200))
-                    # Circular Mask
-                    mask = Image.new("L", (200, 200), 0)
+                    avatar = avatar.resize((200,200))
+                    mask = Image.new("L", (200,200), 0)
                     draw_mask = ImageDraw.Draw(mask)
-                    draw_mask.ellipse((0, 0, 200, 200), fill=255)
-                    img.paste(avatar, (300, 50), mask=mask)
-                    # Border
-                    draw.ellipse((300, 50, 500, 250), outline="white", width=3)
-    except (asyncio.TimeoutError, aiohttp.ClientError, Exception):
-        pass  # If avatar fails, just skip it
+                    draw_mask.ellipse((0,0,200,200), fill=255)
+                    img.paste(avatar, (300,50), mask=mask)
+                    draw.ellipse((300,50,500,250), outline="white", width=3)
+    except: pass
 
-    # 5. Text (Auto-downloads font so it looks good)
     try:
         font_large = ImageFont.truetype("font.ttf", 60)
         font_small = ImageFont.truetype("font.ttf", 40)
     except:
-        # Emergency backup if download failed
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
 
-    # Draw Text
-    draw.text((W / 2, 290), title_text, fill="white", font=font_small, anchor="mm")
-    draw.text((W / 2, 350), player.name.upper(), fill="white", font=font_large, anchor="mm")
+    draw.text((W/2, 290), title_text, fill="white", font=font_small, anchor="mm")
+    draw.text((W/2, 350), player.name.upper(), fill="white", font=font_large, anchor="mm")
 
-    # Save to Buffer
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
@@ -261,11 +222,9 @@ def create_transaction_embed(guild, title, description, color, team_role, logo, 
     embed = discord.Embed(description=description, color=color, timestamp=datetime.datetime.now())
     embed.set_author(name=guild.name, icon_url=guild.icon.url if guild.icon else None)
     embed.title = title
-    if logo and "http" in logo:
-        embed.set_thumbnail(url=logo)
-    if coach:
-        embed.add_field(name="Coach:", value=f"👔 {coach.mention}", inline=False)
-    roster_text = f"{roster_count}/{limit}" if limit > 0 else f"{roster_count} (No Limit)"
+    if logo and "http" in logo: embed.set_thumbnail(url=logo)
+    if coach: embed.add_field(name="Coach:", value=f"👔 {coach.mention}", inline=False)
+    roster_text = f"{roster_count}/{limit}" if limit>0 else f"{roster_count} (No Limit)"
     embed.add_field(name="Roster:", value=f"👥 {roster_text}", inline=False)
     embed.set_footer(text="Official Transaction")
     return embed
@@ -280,14 +239,10 @@ async def send_to_channel(guild, embed, file=None):
     return False
 
 async def send_dm(user, content=None, embed=None, view=None):
-    try:
-        await user.send(content=content, embed=embed, view=view)
-        return True
-    except:
-        return False
+    try: await user.send(content=content, embed=embed, view=view); return True
+    except: return False
 
 # --- VIEWS ---
-
 class TransferView(discord.ui.View):
     def __init__(self, guild, player, from_team, to_team, to_manager, logo):
         super().__init__(timeout=86400)
@@ -307,8 +262,7 @@ class TransferView(discord.ui.View):
 
         try:
             member = self.guild.get_member(self.player.id)
-            if not member:
-                return await interaction.followup.send("❌ Player missing.", ephemeral=True)
+            if not member: return await interaction.followup.send("❌ Player missing.", ephemeral=True)
 
             await member.remove_roles(self.from_team)
             await member.add_roles(self.to_team)
@@ -316,13 +270,11 @@ class TransferView(discord.ui.View):
             update_stat(member.id, "transfer")
 
             desc = f"🚨 **TRANSFER NEWS** 🚨\n\n{member.mention} has been transferred\nFrom: {self.from_team.mention}\nTo: {self.to_team.mention}"
-
             data = get_team_data(self.to_team.id)
             limit = data[2] if data else 0
-            custom_bg = data[3] if data and len(data) > 3 else None
+            custom_bg = data[3] if data and len(data)>3 else None
 
             embed = create_transaction_embed(self.guild, "Official Transfer", desc, discord.Color.purple(), self.to_team, self.logo, self.to_manager, len(self.to_team.members), limit)
-
             file = await generate_transaction_card(member, self.to_team.name, self.to_team.color, "OFFICIAL TRANSFER", custom_bg)
             embed.set_image(url="attachment://transaction.png")
 
@@ -330,8 +282,7 @@ class TransferView(discord.ui.View):
             await send_dm(self.to_manager, f"✅ Transfer for **{member.name}** ACCEPTED!")
 
             self.stop()
-            for child in self.children:
-                child.disabled = True
+            for child in self.children: child.disabled = True
             await interaction.message.edit(content="✅ **Transfer Approved.**", view=self)
 
         except Exception as e:
@@ -342,8 +293,7 @@ class TransferView(discord.ui.View):
         await interaction.response.defer()
         await send_dm(self.to_manager, f"❌ Transfer for **{self.player.name}** DECLINED.")
         self.stop()
-        for child in self.children:
-            child.disabled = True
+        for child in self.children: child.disabled = True
         await interaction.message.edit(content="❌ **Transfer Declined.**", view=self)
 
 class HelpView(discord.ui.View):
@@ -355,7 +305,7 @@ class HelpView(discord.ui.View):
 
     def update_buttons(self):
         self.previous.disabled = self.current_page == 0
-        self.next.disabled = self.current_page == len(self.embeds) - 1
+        self.next.disabled = self.current_page == len(self.embeds)-1
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.primary)
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -376,7 +326,6 @@ class ResetView(discord.ui.View):
 
     @discord.ui.button(label="⚠️ CONFIRM WIPE", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Delete Config
         c.execute("DELETE FROM global_config WHERE guild_id = ?", (self.guild_id,))
         conn.commit()
         await interaction.response.edit_message(content="✅ **Configuration Wiped.** Please run `/setup_global` again.", view=None, embed=None)
@@ -390,9 +339,13 @@ class LeagueBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.all())
         self.tree = app_commands.CommandTree(self)
+        self._synced = False
 
     async def on_ready(self):
-        await self.tree.sync()
+        if not self._synced:
+            await self.tree.sync()
+            self._synced = True
+            print("✅ Command tree synced.")
         print(f"✅ LOGGED IN AS: {self.user}")
 
 client = LeagueBot()
@@ -400,18 +353,13 @@ client = LeagueBot()
 # --- COMMANDS ---
 @client.tree.command(name="leave_other_servers", description="[OWNER ONLY] Makes the bot leave all other servers.")
 async def leave_other_servers(interaction: discord.Interaction):
-    # SECURITY: Replace this number with your actual Discord User ID!
     OWNER_ID = 925817680848617486
-
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("❌ **Access Denied:** You are not the bot owner.", ephemeral=True)
         return
-
     await interaction.response.send_message("🚨 **Initiating Server Cleansing...** Please wait.", ephemeral=True)
-
     left_count = 0
     error_count = 0
-
     for guild in client.guilds:
         if guild.id == interaction.guild_id:
             continue
@@ -422,7 +370,6 @@ async def leave_other_servers(interaction: discord.Interaction):
         except Exception as e:
             error_count += 1
             print(f"System: Failed to leave '{guild.name}'. Error: {e}")
-
     await interaction.followup.send(f"✅ **Done!** I have successfully left **{left_count}** servers. (Errors: {error_count})\nI am now only active in this server.", ephemeral=True)
 
 @client.tree.command(name="help", description="Show bot commands")
@@ -457,24 +404,18 @@ async def tm_transfer(interaction: discord.Interaction, player: discord.Member):
     g_config = get_global_config(interaction.guild.id)
     if not g_config:
         return await interaction.response.send_message("❌ Config not set.", ephemeral=True)
-
     mgr_role_id = g_config[1]
     mgr_role = interaction.guild.get_role(mgr_role_id)
-
     if not mgr_role:
         return await interaction.response.send_message("❌ Manager role missing from config.", ephemeral=True)
-
     if mgr_role not in interaction.user.roles:
         return await interaction.response.send_message("❌ You are not a Team Manager.", ephemeral=True)
-
     team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You don't have a team.", ephemeral=True)
     team_role = team_info[0]
-
     if team_role not in player.roles:
         return await interaction.response.send_message("❌ That player is not on your team.", ephemeral=True)
-
     try:
         await interaction.user.remove_roles(mgr_role)
         await player.add_roles(mgr_role)
@@ -486,7 +427,6 @@ async def tm_transfer(interaction: discord.Interaction, player: discord.Member):
 async def reset_config(interaction: discord.Interaction):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-
     view = ResetView(interaction.guild.id)
     embed = discord.Embed(title="⚠️ DANGER ZONE", description="Are you sure you want to **RESET** the bot configuration for this server?\n\nThis will delete:\n- Global Config (Roles/Channels)\n- Demand Limits\n\n(It will NOT delete Teams or Player Stats)", color=discord.Color.dark_red())
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -499,7 +439,6 @@ async def setup_global(interaction: discord.Interaction, manager_role: discord.R
     window_state = 1
     if current_config and len(current_config) > 5:
         window_state = current_config[5]
-
     c.execute("INSERT OR REPLACE INTO global_config VALUES (?, ?, ?, ?, ?, ?, ?)",
               (interaction.guild.id, manager_role.id, asst_role.id, channel.id, free_agent_role.id, window_state, demand_limit))
     conn.commit()
@@ -544,18 +483,15 @@ async def decorate_transactions(interaction: discord.Interaction, image_file: di
     user_roles = [r.id for r in interaction.user.roles]
     if (g_config[1] not in user_roles) and (g_config[2] not in user_roles) and not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ Managers or Admins only.", ephemeral=True)
-
     team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You aren't managing a team.", ephemeral=True)
     team_role, _, _, _ = team_info
-
     final_url = None
     if url and url.lower() in ["reset", "none", "remove"]:
         c.execute("UPDATE teams SET transaction_image = NULL WHERE team_role_id = ?", (team_role.id,))
         conn.commit()
         return await interaction.response.send_message(f"✅ **{team_role.name}** reverted to Proxima Default.")
-
     if image_file:
         if not image_file.content_type.startswith("image/"):
             return await interaction.response.send_message("❌ File must be an image.", ephemeral=True)
@@ -566,7 +502,6 @@ async def decorate_transactions(interaction: discord.Interaction, image_file: di
         final_url = url
     else:
         return await interaction.response.send_message("❌ Provide an **Image File** OR a **URL**.", ephemeral=True)
-
     c.execute("UPDATE teams SET transaction_image = ? WHERE team_role_id = ?", (final_url, team_role.id))
     conn.commit()
     embed = discord.Embed(title="Background Updated", description="Your future signings will look like this:", color=discord.Color.green())
@@ -576,34 +511,27 @@ async def decorate_transactions(interaction: discord.Interaction, image_file: di
 @client.tree.command(name="sign", description="Sign a player to YOUR team")
 async def sign(interaction: discord.Interaction, player: discord.Member):
     await interaction.response.defer()
-
     if not is_window_open(interaction.guild.id):
         return await interaction.followup.send("❌ **Window Closed.**")
-
     g_config = get_global_config(interaction.guild.id)
     user_roles = [r.id for r in interaction.user.roles]
     if (g_config[1] not in user_roles) and (g_config[2] not in user_roles):
         return await interaction.followup.send("❌ Not Authorized.")
-
     team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.followup.send("❌ No team role.")
     team_role, logo, limit, custom_bg = team_info
-
     if team_role in player.roles:
         return await interaction.followup.send("⚠️ Already on team.")
     if find_user_team(player):
         return await interaction.followup.send("🚫 Player on another team. Use `/transfer`.")
     if len(team_role.members) >= limit:
         return await interaction.followup.send("❌ Roster Full!")
-
     await player.add_roles(team_role)
     await cleanup_free_agent(interaction.guild, player)
     update_stat(player.id, "transfer")
-
     desc = f"The {team_role.mention} have **signed** {player.mention}"
     embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.blue(), team_role, logo, interaction.user, len(team_role.members), limit)
-
     try:
         file = await generate_transaction_card(player, team_role.name, team_role.color, "OFFICIAL SIGNING", custom_bg)
         embed.set_image(url="attachment://transaction.png")
@@ -611,7 +539,6 @@ async def sign(interaction: discord.Interaction, player: discord.Member):
     except Exception as e:
         await interaction.followup.send(f"⚠️ Signed, but image error: {e}")
         await send_to_channel(interaction.guild, embed)
-
     await send_dm(player, content=f"✅ You have been signed to **{team_role.name}**!", embed=embed)
     await interaction.followup.send("✅ Player Signed!")
 
@@ -619,26 +546,21 @@ async def sign(interaction: discord.Interaction, player: discord.Member):
 async def release(interaction: discord.Interaction, player: discord.Member):
     if not is_window_open(interaction.guild.id):
         return await interaction.response.send_message("❌ Window Closed.", ephemeral=True)
-
     team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ No team.", ephemeral=True)
     team_role, logo, limit, custom_bg = team_info
-
     if team_role not in player.roles:
         return await interaction.response.send_message("⚠️ Player not on team.", ephemeral=True)
     await player.remove_roles(team_role)
-
     desc = f"The **{team_role.name}** have **released** {player.mention}"
     embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.red(), team_role, logo, interaction.user, len(team_role.members), limit)
-
     try:
         file = await generate_transaction_card(player, team_role.name, team_role.color, "OFFICIAL RELEASE", custom_bg)
         embed.set_image(url="attachment://transaction.png")
         await send_to_channel(interaction.guild, embed, file)
     except:
         await send_to_channel(interaction.guild, embed)
-
     await send_dm(player, content=f"⚠️ Released from **{team_role.name}**.", embed=embed)
     await interaction.response.send_message("✅ Released!", ephemeral=True)
 
@@ -648,29 +570,23 @@ async def demand(interaction: discord.Interaction):
     if not team_info:
         return await interaction.response.send_message("❌ Not in a team.", ephemeral=True)
     team_role, logo, limit, _ = team_info
-
     g_conf = get_global_config(interaction.guild.id)
     demand_limit = g_conf[6] if g_conf and len(g_conf) > 6 else 3
     stats = get_player_stats(interaction.user.id)
     demands_used = stats[2]
-
     if demands_used >= demand_limit:
         return await interaction.response.send_message(f"🚫 **Demand Limit Reached!** ({demands_used}/{demand_limit})\nYou cannot leave your team.", ephemeral=True)
-
     await interaction.user.remove_roles(team_role)
     update_stat(interaction.user.id, "demand")
     demands_left = demand_limit - (demands_used + 1)
-
     config = get_global_config(interaction.guild.id)
     if config and config[4]:
         fa_role = interaction.guild.get_role(config[4])
         if fa_role:
             await interaction.user.add_roles(fa_role)
-
     desc = f"{interaction.user.mention} has **Demanded Release** from the team.\n\n⚠️ **Demands Left:** {demands_left}"
     embed = create_transaction_embed(interaction.guild, "Transfer Demand", desc, discord.Color.dark_grey(), team_role, logo, None, len(team_role.members), limit)
     await send_to_channel(interaction.guild, embed)
-
     heads, assts = get_managers_of_team(interaction.guild, team_role)
     for mgr in heads + assts:
         await send_dm(mgr, content=f"📢 {interaction.user.name} has left your team.")
@@ -682,20 +598,16 @@ async def promote(interaction: discord.Interaction, player: discord.Member):
     user_roles = [r.id for r in interaction.user.roles]
     if g_config[1] not in user_roles and not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ Head Managers only.", ephemeral=True)
-
     team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You aren't managing a team.", ephemeral=True)
     team_role = team_info[0]
-
     if team_role not in player.roles:
         return await interaction.response.send_message("❌ Player is not on your team.", ephemeral=True)
-
     asst_role_id = g_config[2]
     asst_role = interaction.guild.get_role(asst_role_id)
     if not asst_role:
         return await interaction.response.send_message("❌ Assistant Role not configured.", ephemeral=True)
-
     await player.add_roles(asst_role)
     await interaction.response.send_message(f"✅ Promoted {player.mention} to **Assistant Manager** of {team_role.name}!")
 
@@ -703,20 +615,16 @@ async def promote(interaction: discord.Interaction, player: discord.Member):
 async def transfer_list(interaction: discord.Interaction):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-
     c.execute("SELECT user_id, transfers FROM player_stats ORDER BY transfers DESC LIMIT 15")
     data = c.fetchall()
-
     if not data:
         return await interaction.response.send_message("No transfer history found.", ephemeral=True)
-
     embed = discord.Embed(title="📊 Most Transfers", color=discord.Color.gold())
     desc = ""
     for idx, (uid, count) in enumerate(data, 1):
         user = interaction.guild.get_member(uid)
         name = user.name if user else f"Unknown ({uid})"
         desc += f"**{idx}.** {name} — {count} Transfers\n"
-
     embed.description = desc
     await interaction.response.send_message(embed=embed)
 
@@ -758,11 +666,9 @@ async def team_list(interaction: discord.Interaction):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
     await interaction.response.defer()
-
     g_conf = get_global_config(interaction.guild.id)
     mgr_id = g_conf[1] if g_conf else 0
     asst_id = g_conf[2] if g_conf else 0
-
     all_teams = get_all_teams()
     if not all_teams:
         return await interaction.followup.send("❌ No teams.")
@@ -806,24 +712,19 @@ async def transfer(interaction: discord.Interaction, player: discord.Member):
     if not my_team_info:
         return await interaction.response.send_message("❌ Not a manager.", ephemeral=True)
     my_team_role, my_logo, _, _ = my_team_info
-
     target_team_info = find_user_team(player)
     if not target_team_info:
         return await interaction.response.send_message("⚠️ Player not on a team.", ephemeral=True)
     target_team_role, _, _, _ = target_team_info
-
     if my_team_role.id == target_team_role.id:
         return await interaction.response.send_message("⚠️ Already on your team!", ephemeral=True)
-
     heads, assts = get_managers_of_team(interaction.guild, target_team_role)
     target_manager = heads[0] if heads else (assts[0] if assts else None)
     if not target_manager:
         return await interaction.response.send_message(f"❌ **{target_team_role.name}** has no active Manager.", ephemeral=True)
-
     view = TransferView(interaction.guild, player, target_team_role, my_team_role, interaction.user, my_logo)
     dm_embed = discord.Embed(title="Transfer Offer 📝", color=discord.Color.gold())
     dm_embed.description = f"**{interaction.user.mention}** wants to buy **{player.name}**.\nDo you accept?"
-
     if await send_dm(target_manager, embed=dm_embed, view=view):
         await interaction.response.send_message(f"✅ **Offer Sent!** Waiting for {target_manager.mention}.", ephemeral=True)
     else:
@@ -856,12 +757,33 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         except:
             pass
 
-# --- STARTUP ---
-print("System: Loading Proxima V17 (Auto-Font Download)...")
-if TOKEN:
-    try:
-        keep_alive()
-        client.run(TOKEN)
-    except Exception as e:
-        print(f"❌ Error: {e}")
-# --- END ---
+# --- STARTUP WITH RETRY ON 429 ---
+def run_bot():
+    retries = 0
+    max_retries = 5
+    base_delay = 5
+
+    while retries < max_retries:
+        try:
+            keep_alive()
+            client.run(TOKEN)
+            break
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                retries += 1
+                wait = base_delay * (2 ** retries)
+                print(f"⚠️ Rate limited (429). Retrying in {wait}s... (attempt {retries}/{max_retries})")
+                time.sleep(wait)
+            else:
+                print(f"❌ HTTP Exception: {e}")
+                break
+        except Exception as e:
+            print(f"❌ Unexpected error: {e}")
+            break
+
+if __name__ == "__main__":
+    print("System: Loading Proxima V17 (Auto-Font Download)...")
+    if TOKEN:
+        run_bot()
+    else:
+        print("❌ TOKEN environment variable not set.")
