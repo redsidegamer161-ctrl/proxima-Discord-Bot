@@ -1,5 +1,4 @@
 discord.py
-aiohttp
 Pillow
+aiohttp
 Flask
-aiosqlite
