@@ -864,3 +864,4 @@ if TOKEN:
         client.run(TOKEN)
     except Exception as e:
         print(f"❌ Error: {e}")
+# --- END ---
