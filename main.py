@@ -350,7 +350,7 @@ class LeagueBot(discord.Client):
 
 client = LeagueBot()
 
-# --- COMMANDS ---
+# --- COMMANDS (full list - all preserved) ---
 @client.tree.command(name="leave_other_servers", description="[OWNER ONLY] Makes the bot leave all other servers.")
 async def leave_other_servers(interaction: discord.Interaction):
     OWNER_ID = 925817680848617486
